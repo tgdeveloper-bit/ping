@@ -2,51 +2,35 @@ from __future__ import annotations
 import asyncio, logging, os, secrets, uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from dashboard import router as dashboard_router, init as dashboard_init
 from urllib.parse import urlparse
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, HttpUrl, field_validator
-
-from dashboard import router as dashboard_router, init as dashboard_init
+from fastapi.responses import RedirectResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pinger")
 
-# ---------- config ----------
-ADMIN_TOKEN     = os.getenv("ADMIN_TOKEN")
+ADMIN_TOKdashboardEN = os.getenv("ADMIN_TOKEN")
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
-USER_AGENT      = "UptimePinger/1.0 (+https://example.com/bot)"
-
-# ---------- default targets (auto-seed on every restart) ----------
-DEFAULT_TARGETS = [
-    "https://tg-server-t88w.onrender.com/health",
-    "https://work-server-1-lysa.onrender.com/health",
-    "https://work-server-2.onrender.com/health",
-    "https://otp-server-1-qcun.onrender.com/health",
-    "https://processor-server-main.onrender.com",
-    "https://ai-server-no-1.onrender.com/health",
-    "https://processor-server-2.onrender.com/health",
-    "https://proxy-server-ai-1.onrender.com/health",
-    "https://proxy-server-ai-2.onrender.com/health",
-    "https://proxy-server-ai-3.onrender.com/health",
-    "https://proxy-server-ai-4.onrender.com/health",
-    "https://proxy-server-ai-6.onrender.com/health",
-    "https://proxy-server-ai-9.onrender.com/health",
-]
+USER_AGENT = "UptimePinger/1.0 (+https://example.com/bot)"
 
 # ---------- state ----------
 targets: dict[str, dict] = {}
 GLOBAL_PAUSED = False
-_lock = asyncio.Lock()
+_lock = asyncio.Lock()          # protects `targets` mutations
+
 
 # ---------- auth ----------
 def check_token(token: str | None) -> None:
-    if not token or not secrets.compare_digest(token, ADMIN_TOKEN or ""):
+    # constant-time compare to avoid timing attacks
+    if not token or not secrets.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(401, "Invalid admin token")
+
 
 # ---------- validation ----------
 def valid_url(u: str) -> bool:
@@ -56,8 +40,9 @@ def valid_url(u: str) -> bool:
     except Exception:
         return False
 
+
 # ---------- worker ----------
-async def _ping_one(sem, client, tid, t):
+async def _ping_one(sem: asyncio.Semaphore, client: httpx.AsyncClient, tid: str, t: dict) -> None:
     async with sem:
         if GLOBAL_PAUSED or not t.get("active"):
             return
@@ -74,14 +59,12 @@ async def hit_targets() -> None:
     if GLOBAL_PAUSED or client is None:
         return
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    # snapshot to avoid "dict changed size" if admin mutates during run
     snapshot = list(targets.items())
     await asyncio.gather(*(_ping_one(sem, client, tid, t) for tid, t in snapshot))
 
+
 # ---------- lifespan ----------
-client: httpx.AsyncClient | None = None
-scheduler: AsyncIOScheduler | None = None
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, scheduler
@@ -92,25 +75,11 @@ async def lifespan(app: FastAPI):
     )
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        hit_targets, "interval", minutes=1, id="main_job",
+        hit_targets, "interval", minutes=7, id="main_job",
         max_instances=1, coalesce=True, misfire_grace_time=30,
     )
     scheduler.start()
-
-    # 🌱 seed default targets on every startup
-    existing = {t["url"] for t in targets.values()}
-    seeded = 0
-    for url in DEFAULT_TARGETS:
-        if url not in existing:
-            targets[uuid.uuid4().hex[:8]] = {
-                "url": url, "active": True,
-                "last_status": None, "last_hit": None,
-            }
-            existing.add(url)
-            seeded += 1
-    log.info("started; seeded=%d total=%d concurrency=%d timeout=%.1fs",
-             seeded, len(targets), MAX_CONCURRENCY, REQUEST_TIMEOUT)
-
+    log.info("started; concurrency=%d timeout=%.1fs", MAX_CONCURRENCY, REQUEST_TIMEOUT)
     try:
         yield
     finally:
@@ -119,6 +88,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+client: httpx.AsyncClient | None = None
+scheduler: AsyncIOScheduler | None = None
+
 
 # ---------- models ----------
 class BulkAdd(BaseModel):
@@ -138,13 +111,14 @@ class BulkAdd(BaseModel):
 class TargetPatch(BaseModel):
     active: bool
 
-# ---------- bulk-add wrapper for dashboard ----------
+# ---------- bulk-add wrapper (dashboard router এটাকে কল করবে) ----------
 async def _bulk_add_wrapper(urls: list[str]) -> dict:
+    from pydantic import HttpUrl
     added = 0
     async with _lock:
         existing = {t["url"] for t in targets.values()}
         for raw in urls:
-            s = str(raw).strip()
+            s = str(raw).strip().rstrip("/") if str(raw).endswith("/") else str(raw).strip()
             if not s.startswith("http") or s in existing:
                 continue
             tid = uuid.uuid4().hex[:8]
@@ -154,17 +128,11 @@ async def _bulk_add_wrapper(urls: list[str]) -> dict:
     return {"added": added, "total": len(targets)}
 
 
-# ---------- pause setter (cleaner than globals().update) ----------
-def _set_paused(v: bool) -> None:
-    global GLOBAL_PAUSED
-    GLOBAL_PAUSED = v
-
-
-# ---------- inject shared state into dashboard router ----------
+# ---------- dashboard-এ shared state inject ----------
 dashboard_init(
     targets_getter=lambda: targets,
     paused_getter=lambda: GLOBAL_PAUSED,
-    paused_setter=_set_paused,
+    paused_setter=lambda v: globals().update(GLOBAL_PAUSED=v),
     lock=lambda: _lock,
     bulk_add_fn=_bulk_add_wrapper,
 )
@@ -173,11 +141,6 @@ dashboard_init(
 @app.get("/health")
 async def health():
     return {"ok": True, "global_paused": GLOBAL_PAUSED, "targets": len(targets)}
-
-
-@app.get("/")
-async def root():
-    return RedirectResponse("/dashboard", status_code=303)
 
 
 @app.post("/admin/bulk-add")
@@ -190,7 +153,7 @@ async def bulk_add(body: BulkAdd, x_admin_token: str = Header(None)):
             s = str(u)
             if s in existing:
                 continue
-            tid = uuid.uuid4().hex[:8]
+            tid = uuid.uuid4().hex[:8]        # collision-free
             targets[tid] = {"url": s, "active": True, "last_status": None, "last_hit": None}
             existing.add(s)
             added += 1
@@ -210,17 +173,23 @@ async def list_targets(limit: int = 100, offset: int = 0,
     }
 
 
+@app.get("/")
+async def root():
+    return RedirectResponse("/dashboard", status_code=303)
+
 @app.post("/admin/pause-all")
 async def pause_all(x_admin_token: str = Header(None)):
     check_token(x_admin_token)
-    _set_paused(True)
+    global GLOBAL_PAUSED
+    GLOBAL_PAUSED = True
     return {"global_paused": True}
 
 
 @app.post("/admin/resume-all")
 async def resume_all(x_admin_token: str = Header(None)):
     check_token(x_admin_token)
-    _set_paused(False)
+    global GLOBAL_PAUSED
+    GLOBAL_PAUSED = False
     return {"global_paused": False}
 
 
@@ -261,6 +230,4 @@ async def delete_one(tid: str, x_admin_token: str = Header(None)):
 def _404():
     raise HTTPException(404, "target not found")
 
-
-# ---------- include dashboard router (LAST!) ----------
 app.include_router(dashboard_router)

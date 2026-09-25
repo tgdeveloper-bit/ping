@@ -1,28 +1,11 @@
 """
-Pinger Dashboard — separate router module.
+Pinger Dashboard — separate router module (NO LOGIN).
 server.py শুধু `app.include_router(dashboard_router)` করবে।
 """
-import hashlib
-import hmac
-import os
-import time
-import uuid
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
 
-from fastapi import APIRouter, Cookie, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
-
-# ---------- config (env থেকে লোড) ----------
-ADMIN_TOKEN        = os.getenv("ADMIN_TOKEN", "")
-DASHBOARD_PASSWORD = (os.getenv("DASHBOARD_PASSWORD") or ADMIN_TOKEN).strip()
-SESSION_SECRET     = (
-    os.getenv("SESSION_SECRET")
-    or hashlib.sha256((ADMIN_TOKEN + "|" + DASHBOARD_PASSWORD + "|pinger-v1").encode()).hexdigest()
-)
-SESSION_TTL = 7 * 24 * 3600
-COOKIE_NAME = "pinger_session"
-
-# ---------- shared state থেকে আসবে (server.py সেট করবে) ----------
-# আমরা ফাংশন ইনজেক্ট করব যাতে server.py-এর globals-এ access পাই
+# ---------- shared state (server.py inject করবে) ----------
 _get_targets = lambda: {}
 _get_paused  = lambda: False
 _set_paused  = lambda v: None
@@ -31,7 +14,6 @@ _bulk_add_fn = None
 
 
 def init(targets_getter, paused_getter, paused_setter, lock, bulk_add_fn):
-    """server.py থেকে কল হবে — shared state inject করে।"""
     global _get_targets, _get_paused, _set_paused, _get_lock, _bulk_add_fn
     _get_targets = targets_getter
     _get_paused  = paused_getter
@@ -40,67 +22,7 @@ def init(targets_getter, paused_getter, paused_setter, lock, bulk_add_fn):
     _bulk_add_fn = bulk_add_fn
 
 
-# ---------- session helpers ----------
-def _make_session() -> str:
-    ts = str(int(time.time()))
-    sig = hmac.new(SESSION_SECRET.encode(), ts.encode(), hashlib.sha256).hexdigest()
-    return f"{ts}.{sig}"
-
-
-def _check_session(v: str | None) -> bool:
-    if not v or "." not in v:
-        return False
-    ts, sig = v.rsplit(".", 1)
-    try:
-        if int(ts) + SESSION_TTL < time.time():
-            return False
-    except ValueError:
-        return False
-    expected = hmac.new(SESSION_SECRET.encode(), ts.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
-
-
-def _require_session(session: str | None) -> None:
-    if not _check_session(session):
-        raise HTTPException(401, "login required")
-
-
 # ---------- HTML ----------
-LOGIN_HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Login — Pinger</title>
-<style>
-  :root{--bg:#0b0f17;--fg:#e5e7eb;--muted:#6b7280;--err:#ef4444}
-  *{box-sizing:border-box}
-  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-       background:var(--bg);color:var(--fg);font-family:ui-monospace,Menlo,monospace;padding:20px}
-  .card{width:100%;max-width:360px;background:#111827;border:1px solid #1f2937;
-        border-radius:12px;padding:28px 24px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
-  h1{margin:0 0 4px;font-size:18px}
-  p.sub{margin:0 0 20px;color:var(--muted);font-size:12px}
-  label{display:block;font-size:11px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
-  input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #374151;
-        background:#0b0f17;color:var(--fg);font-family:inherit;font-size:14px;margin-bottom:14px}
-  input:focus{outline:none;border-color:#2563eb}
-  button{width:100%;padding:11px;border-radius:8px;border:none;background:#2563eb;color:#fff;
-         font-family:inherit;font-size:14px;font-weight:600;cursor:pointer}
-  button:hover{background:#1d4ed8}
-  .err{background:rgba(239,68,68,.1);border:1px solid var(--err);color:var(--err);
-       padding:8px 10px;border-radius:6px;font-size:12px;margin-bottom:14px}
-</style></head>
-<body>
-<form class="card" method="POST" action="/login">
-  <h1>🛰️ Pinger</h1>
-  <p class="sub">Admin access required</p>
-  __ERR__
-  <label for="pw">Password</label>
-  <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
-  <button type="submit">🔓 Unlock Dashboard</button>
-</form>
-</body></html>
-"""
-
-
 DASHBOARD_HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pinger Dashboard</title>
@@ -119,7 +41,6 @@ DASHBOARD_HTML = r"""<!doctype html>
   button:hover{background:#374151}
   button.primary{background:#2563eb;border-color:#2563eb;color:#fff}
   button.warn{background:#b45309;border-color:#b45309;color:#fff}
-  button.ghost{background:transparent;border-color:#374151;color:var(--muted)}
   .meta{color:var(--muted);font-size:11px}
   table{width:100%;border-collapse:collapse;font-size:12px}
   th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #1f2937}
@@ -148,7 +69,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button class="warn"    onclick="toggleAll(true)">⏸ Pause</button>
     <button class="primary" onclick="toggleAll(false)">▶ Resume</button>
     <button class="primary" onclick="toggleAdd()">＋ Add</button>
-    <button class="ghost"   onclick="logout()">⏻ Logout</button>
   </div>
 </header>
 
@@ -157,7 +77,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <textarea id="addUrls" placeholder="https://example.com/health&#10;https://httpbin.org/get"></textarea>
   <div style="margin-top:8px;display:flex;gap:6px">
     <button class="primary" onclick="doAdd()">Add</button>
-    <button class="ghost"   onclick="toggleAdd()">Cancel</button>
+    <button class="warn"    onclick="toggleAdd()">Cancel</button>
   </div>
 </div>
 
@@ -176,9 +96,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script>
 async function fetchData(){
   try{
-    const r = await fetch("/api/targets", {cache:"no-store", credentials:"same-origin"});
-    if (r.status === 401) { location.href = "/login"; return; }
-    if (!r.ok) { document.getElementById("state").textContent = "REMOTE " + r.status; return; }
+    const r = await fetch("/api/targets", {cache:"no-store"});
+    if (!r.ok) { document.getElementById("state").textContent = "ERROR " + r.status; return; }
     render(await r.json());
   }catch(e){ document.getElementById("state").textContent = "OFFLINE"; }
 }
@@ -210,17 +129,17 @@ function render(d){
   document.getElementById("errc").textContent = err;
 }
 async function toggleAll(pause){
-  await fetch(pause?"/api/pause-all":"/api/resume-all",{method:"POST",credentials:"same-origin"});
+  await fetch(pause?"/api/pause-all":"/api/resume-all",{method:"POST"});
   fetchData();
 }
 async function toggleOne(id, active){
-  await fetch(`/api/targets/${id}`,{method:"PATCH",credentials:"same-origin",
+  await fetch(`/api/targets/${id}`,{method:"PATCH",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({active})});
   fetchData();
 }
 async function delOne(id){
   if (!confirm("Delete this target?")) return;
-  await fetch(`/api/targets/${id}`,{method:"DELETE",credentials:"same-origin"});
+  await fetch(`/api/targets/${id}`,{method:"DELETE"});
   fetchData();
 }
 function toggleAdd(){
@@ -233,17 +152,13 @@ async function doAdd(){
   if (!txt) return;
   const urls=txt.split(/\s+/).filter(u=>/^https?:\/\//.test(u));
   if (!urls.length){ alert("No valid http(s) URLs"); return; }
-  const r=await fetch("/api/bulk-add",{method:"POST",credentials:"same-origin",
+  const r=await fetch("/api/bulk-add",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({urls})});
   const j=await r.json();
   alert(`Added ${j.added||0}, total ${j.total||0}`);
   document.getElementById("addUrls").value="";
   toggleAdd();
   fetchData();
-}
-async function logout(){
-  await fetch("/logout",{method:"POST",credentials:"same-origin"});
-  location.href="/login";
 }
 setInterval(()=>{
   document.getElementById("clock").textContent =
@@ -261,43 +176,14 @@ setInterval(fetchData, 5000);
 router = APIRouter()
 
 
-@router.get("/login", response_class=HTMLResponse)
-async def login_page():
-    return LOGIN_HTML.replace("__ERR__", "")
-
-
-@router.post("/login")
-async def do_login(password: str = Form(...)):
-    if not DASHBOARD_PASSWORD or not hmac.compare_digest(password.strip(), DASHBOARD_PASSWORD):
-        html = LOGIN_HTML.replace("__ERR__", '<div class="err">❌ Wrong password</div>')
-        return HTMLResponse(html, status_code=401)
-    resp = RedirectResponse("/dashboard", status_code=303)
-    resp.set_cookie(
-        COOKIE_NAME, _make_session(),
-        max_age=SESSION_TTL, httponly=True, samesite="strict",
-        secure=True, path="/",
-    )
-    return resp
-
-
-@router.post("/logout")
-async def do_logout():
-    resp = RedirectResponse("/login", status_code=303)
-    resp.delete_cookie(COOKIE_NAME, path="/")
-    return resp
-
-
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(session: str = Cookie(None)):
-    if not _check_session(session):
-        return RedirectResponse("/login", status_code=303)
+async def dashboard_page():
     return DASHBOARD_HTML
 
 
-# ---------- APIs (cookie auth) ----------
+# ---------- APIs (no auth) ----------
 @router.get("/api/targets")
-async def api_targets(session: str = Cookie(None)):
-    _require_session(session)
+async def api_targets():
     t = _get_targets()
     return {
         "global_paused": _get_paused(),
@@ -308,29 +194,25 @@ async def api_targets(session: str = Cookie(None)):
 
 
 @router.post("/api/pause-all")
-async def api_pause_all(session: str = Cookie(None)):
-    _require_session(session)
+async def api_pause_all():
     _set_paused(True)
     return {"global_paused": True}
 
 
 @router.post("/api/resume-all")
-async def api_resume_all(session: str = Cookie(None)):
-    _require_session(session)
+async def api_resume_all():
     _set_paused(False)
     return {"global_paused": False}
 
 
 @router.post("/api/bulk-add")
-async def api_bulk_add(body: dict, session: str = Cookie(None)):
-    _require_session(session)
+async def api_bulk_add(body: dict):
     urls = body.get("urls") or []
     return await _bulk_add_fn(urls)
 
 
 @router.patch("/api/targets/{tid}")
-async def api_patch(tid: str, body: dict, session: str = Cookie(None)):
-    _require_session(session)
+async def api_patch(tid: str, body: dict):
     t = _get_targets().get(tid)
     if not t:
         raise HTTPException(404, "target not found")
@@ -339,8 +221,7 @@ async def api_patch(tid: str, body: dict, session: str = Cookie(None)):
 
 
 @router.delete("/api/targets/{tid}")
-async def api_delete(tid: str, session: str = Cookie(None)):
-    _require_session(session)
+async def api_delete(tid: str):
     async with _get_lock():
         t = _get_targets()
         if tid not in t:
